@@ -1390,13 +1390,8 @@ class PipelineDataLoader:
     # to know the epoch, so we synchronize the epoch so the processes that don't use the dataloader
     # know the current epoch.
     def sync_epoch(self):
-        process_group = dist.get_world_group()
-        result = [None] * dist.get_world_size(process_group)
-        torch.distributed.all_gather_object(result, self.epoch, group=process_group)
-        max_epoch = -1
-        for epoch in result:
-            max_epoch = max(epoch, max_epoch)
-        self.epoch = max_epoch
+        from utils.distributed_control import max_int
+        self.epoch = max_int(self.epoch)
 
     def state_dict(self):
         return {

@@ -10,6 +10,7 @@ from deepspeed import comm as dist
 from deepspeed.utils.logging import logger
 
 from utils.common import is_main_process
+from utils.distributed_control import broadcast_int
 
 
 def convert_state_dict_dtype(state_dict, dtype):
@@ -40,9 +41,7 @@ def need_to_checkpoint(config, epoch=None):
         elif (current_time - last_checkpoint_time) / 60 > config['checkpoint_every_n_minutes']:
             checkpoint = True
             last_checkpoint_time = current_time
-    result = [checkpoint]
-    torch.distributed.broadcast_object_list(result, src=0)
-    return result[0]
+    return bool(broadcast_int(checkpoint))
 
 
 class Saver:
@@ -73,8 +72,8 @@ class Saver:
                         continue
                     # TODO: maybe this needs to change if we ever have non-lora adapters?
                     partial_state_dict[p.original_name.replace('.default', '').replace('.modules_to_save', '')] = p.detach()
-                    if 'save_dtype' in self.config:
-                        convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
+            if 'save_dtype' in self.config:
+                convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
             torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
         dist.barrier()
         if dp_id == 0 and stage_id == 0:
@@ -151,22 +150,19 @@ class Saver:
 
     def process_step(self, step, examples):
         checkpointed, saved = False, False
-        # Look at some simple "signal files" the user can write to save and optionally quit manually
-        should_manually_save = False
-        should_manually_quit = False
+        # Only rank zero checks signal files. All ranks must make the same
+        # checkpoint/exit decision, even with delayed network filesystem visibility.
+        signal = 0
         save_signal_file = self.save_root / 'save'
         save_quit_signal_file = self.save_root / 'save_quit'
-        if save_signal_file.exists() and save_signal_file.is_file():
-            should_manually_save = True
-            dist.barrier()
-            if is_main_process():
-                os.remove(save_signal_file)
-        elif save_quit_signal_file.exists() and save_quit_signal_file.is_file():
-            should_manually_save = True
-            should_manually_quit = True
-            dist.barrier()
-            if is_main_process():
-                os.remove(save_quit_signal_file)
+        if is_main_process():
+            if save_quit_signal_file.is_file():
+                signal = 2
+            elif save_signal_file.is_file():
+                signal = 1
+        signal = broadcast_int(signal)
+        should_manually_save = signal != 0
+        should_manually_quit = signal == 2
 
         if 'save_every_n_steps' in self.config and step % self.config['save_every_n_steps'] == 0:
             self.save_model(f'step{step}')
@@ -175,6 +171,14 @@ class Saver:
         if need_to_checkpoint(self.config) or should_manually_save:
             self.save_checkpoint(step, examples)
             checkpointed = True
+
+        # Keep the request on disk until the checkpoint succeeds.
+        if should_manually_save and is_main_process():
+            signal_file = save_quit_signal_file if should_manually_quit else save_signal_file
+            try:
+                signal_file.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f'Checkpoint saved, but could not remove {signal_file}: {exc}')
 
         if should_manually_quit:
             print('Manually quitting')

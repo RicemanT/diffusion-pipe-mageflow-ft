@@ -13,6 +13,15 @@ class ManualPipelineModule(PipelineModule):
         self.manual_partition_split = manual_partition_split
         super().__init__(*args, **kwargs)
 
+    def _is_checkpointable(self, funcs):
+        # Keep DeepSpeed's eligibility rules; individual layers may opt out.
+        # The trainer uses interval=1, so an opted-out block does not disable
+        # checkpointing of its neighbors. Attributes survive stage partitioning
+        # and do not alter layer classes, parameter ownership, or save paths.
+        if any(getattr(layer, 'checkpoint_enabled', True) is False for layer in funcs):
+            return False
+        return super()._is_checkpointable(funcs)
+
     def _partition_layers(self, method='uniform'):
         if method.lower() == 'manual' and self.manual_partition_split is not None:
             num_stages = self._topo.get_dim('pipe')

@@ -19,6 +19,11 @@ varlen kernel is padding + a key-padding mask on the variable-length text stream
 (identical to how models/qwen_image.py handles its Qwen double-stream blocks).
 This also means training carries no hard flash-attn dependency.
 
+An explicit ``attention_backend`` can select FlashAttention 2 or 3 for
+single-stage training (including multi-GPU data parallelism). Valid joint
+tokens are packed once per attention call, using metadata built once per
+microbatch. The default remains padded SDPA for existing configurations.
+
 Only text-to-image is implemented here (LoRA + full finetune). The upstream
 image-edit / multi-reference path and the inference-time content screening +
 watermarking are intentionally not part of the training graph.
@@ -42,6 +47,11 @@ from utils.common import AUTOCAST_DTYPE
 from utils.offloading import ModelOffloader
 from utils import caption_processing as capproc
 from utils import validation_sampling as vsampling
+from utils.mageflow_text import encode_text_hidden
+from utils.mageflow_execution import validate_execution_config, compile_block_forward
+from utils.mageflow_attention import (
+    packed_attention, packed_attention_metadata, validate_attention_backend,
+)
 
 
 # Make the vendored Mage package importable (Mage/mage_flow -> `import mage_flow`).
@@ -77,6 +87,13 @@ def _apply_rope_batched(x, freqs_complex):
         x: [B, H, L, Dh]
         freqs_complex: [L, Dh//2] complex
     """
+    if not freqs_complex.is_complex():
+        # Compiled blocks receive real/imaginary pairs prepared outside the
+        # graph. Real arithmetic avoids Inductor's complex-number fallback.
+        pairs = x.float().reshape(*x.shape[:-1], -1, 2)
+        real, imag = pairs.unbind(-1)
+        cos, sin = freqs_complex.unbind(-1)
+        return torch.stack((real * cos - imag * sin, real * sin + imag * cos), dim=-1).flatten(-2).type_as(x)
     x_c = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # [B, H, L, Dh/2]
     freqs = freqs_complex.view(1, 1, freqs_complex.shape[0], freqs_complex.shape[1])
     x_out = torch.view_as_real(x_c * freqs).flatten(-2)  # [B, H, L, Dh]
@@ -93,7 +110,8 @@ def _modulate(x, mod):
 
 
 def _double_stream_block_forward(block, hidden_states, encoder_hidden_states, temb,
-                                 img_freqs, attn_mask, num_heads):
+                                 img_freqs, attn_mask, num_heads, attention_backend='sdpa',
+                                 attention_metadata=(), deterministic=False):
     """Batched (SDPA) reimplementation of MageFlowTransformerBlock.forward.
 
     Reuses the block's pretrained submodules but drives them with real batched
@@ -138,7 +156,11 @@ def _double_stream_block_forward(block, hidden_states, encoder_hidden_states, te
     v = torch.cat([tv, iv], dim=2)
 
     # softmax_scale=None upstream -> flash default 1/sqrt(head_dim); SDPA default matches.
-    joint = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    if attention_backend == 'sdpa':
+        joint = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    else:
+        joint = packed_attention(q, k, v, *attention_metadata,
+                                 backend=attention_backend, deterministic=deterministic)
     joint = joint.transpose(1, 2).flatten(2)  # [B, Lt+Li, dim]
 
     txt_attn_output = attn.to_add_out(joint[:, :Lt])
@@ -166,6 +188,10 @@ class MageFlowPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
+        validate_execution_config(config)
+        self.attention_backend = self.model_config.get('attention_backend', 'sdpa')
+        validate_attention_backend(self.attention_backend, self.config.get('pipeline_stages', 1))
+        self.attention_deterministic = self.model_config.get('attention_deterministic', False)
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         dtype = self.model_config['dtype']
 
@@ -307,6 +333,7 @@ class MageFlowPipeline(BasePipeline):
             transformer_path = str(Path(diffusers_path) / 'transformer' / 'diffusion_pytorch_model.safetensors')
 
         params = self._transformer_params()
+        validate_execution_config(self.config, num_blocks=params.depth)
         transformer = MageFlow(params)
 
         sd = load_file(transformer_path, device='cpu')
@@ -438,16 +465,11 @@ class MageFlowPipeline(BasePipeline):
             truncation=True,
             return_tensors='pt',
         ).to(device)
-        outputs = self.text_encoder(
-            input_ids=tokens.input_ids,
-            attention_mask=tokens.attention_mask,
-            output_hidden_states=True,
-        )
-        hidden = outputs.hidden_states[-1]  # [B, L, 2560]
+        hidden = encode_text_hidden(self.text_encoder, tokens.input_ids, tokens.attention_mask)
         # Drop system-prompt tokens and any right padding, per sample.
         embeds = []
-        for h, m in zip(hidden, tokens.attention_mask):
-            valid = int(m.sum().item())
+        lengths = tokens.attention_mask.sum(dim=1).tolist()
+        for h, valid in zip(hidden, lengths):
             embeds.append(h[drop_idx:valid])
         return embeds
 
@@ -562,7 +584,9 @@ class MageFlowPipeline(BasePipeline):
         target = x_0 - x_1
 
         # To token sequences: MageVAE has patch_size 1, so tokens == spatial pixels.
-        img = rearrange(x_t, 'b c h w -> b (h w) c')          # [B, L, 128]
+        # Keep spatial dimensions until InitialLayer, so RoPE uses tensor shape
+        # metadata instead of two synchronizing GPU scalar reads per microbatch.
+        img = x_t                                           # [B, 128, h, w]
         target = rearrange(target, 'b c h w -> b (h w) c')    # [B, L, 128]
         img_hw = torch.tensor([[h, w]], dtype=torch.int32, device=device).repeat(bs, 1)
 
@@ -582,11 +606,32 @@ class MageFlowPipeline(BasePipeline):
 
     def to_layers(self):
         transformer = self.transformer
+        validate_execution_config(self.config, num_blocks=len(transformer.transformer_blocks))
+        selected = self.model_config.get('checkpoint_blocks')
+        compiled_forward = None
+        if self.model_config.get('compile_blocks', False):
+            compiled_forward = compile_block_forward(_double_stream_block_forward, self.model_config)
+            print('MageFlow: compiling transformer blocks except the final block (SDPA, fullgraph, '
+                  f"dynamic={self.model_config.get('compile_dynamic', True)}, "
+                  f"mode={self.model_config.get('compile_mode', 'default')}).")
+        if selected is not None:
+            print(f'MageFlow: checkpointing {len(selected)}/{len(transformer.transformer_blocks)} '
+                  f'transformer blocks; zero-based indices={sorted(selected)}. '
+                  'Unselected blocks retain activations and use more VRAM.')
         te = None if self.cache_text_embeddings else self.text_encoder
         layers = [InitialLayer(transformer, text_encoder=te,
-                               drop_idx=PROMPT_TEMPLATE_ENCODE_START_IDX)]
+                               drop_idx=PROMPT_TEMPLATE_ENCODE_START_IDX,
+                               attention_backend=self.attention_backend)]
         for i, block in enumerate(transformer.transformer_blocks):
-            layers.append(TransformerLayer(block, i, transformer.num_attention_heads, self.offloader))
+            layers.append(TransformerLayer(
+                block, i, transformer.num_attention_heads, self.offloader,
+                self.attention_backend, self.attention_deterministic,
+                checkpoint_enabled=selected is None or i in selected,
+                # AOTAutograd materializes zero gradients for unused text outputs.
+                # In the last block those branches have grad=None in eager mode;
+                # changing that can trigger Adam momentum/decay updates. Keep the
+                # final block eager to preserve the existing optimizer behavior.
+                compiled_forward=compiled_forward if i < len(transformer.transformer_blocks) - 1 else None))
         layers.append(FinalLayer(transformer))
         return layers
 
@@ -630,7 +675,7 @@ class MageFlowPipeline(BasePipeline):
 
 
 class InitialLayer(nn.Module):
-    def __init__(self, model, text_encoder=None, drop_idx=0):
+    def __init__(self, model, text_encoder=None, drop_idx=0, attention_backend='sdpa'):
         super().__init__()
         self.img_in = model.img_in
         self.txt_norm = model.txt_norm
@@ -642,6 +687,13 @@ class InitialLayer(nn.Module):
         # moves it to the stage-0 device.
         self.text_encoder = text_encoder
         self.drop_idx = drop_idx
+        self.attention_backend = attention_backend
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.text_encoder is not None:
+            self.text_encoder.eval()
+        return self
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
@@ -650,15 +702,18 @@ class InitialLayer(nn.Module):
                 item.requires_grad_(True)
 
         img, text0, text1, timestep, img_hw = inputs
+        if img.ndim == 4:
+            h, w = img.shape[-2:]
+            img = rearrange(img, 'b c h w -> b (h w) c')
+        else:
+            # Accept the old token layout for external sampling callers.
+            h, w = int(img_hw[0, 0].item()), int(img_hw[0, 1].item())
 
         if self.text_encoder is not None:
             # On-the-fly: text0=input_ids, text1=attention_mask.
             input_ids = text0.long()
             attn = text1.long()
-            with torch.no_grad():
-                out = self.text_encoder(input_ids=input_ids, attention_mask=attn,
-                                        output_hidden_states=True)
-                hidden = out.hidden_states[-1]
+            hidden = encode_text_hidden(self.text_encoder, input_ids, attn)
             # Drop the system-prompt prefix; keep padding (masked out in attn).
             # detach()+requires_grad_ so the stage-boundary activation is a leaf
             # requiring grad (parallels the cached-embeds path), without
@@ -675,8 +730,6 @@ class InitialLayer(nn.Module):
         encoder_hidden_states = self.txt_in(self.txt_norm(txt))
         temb = self.time_text_embed(timestep, hidden_states)
 
-        h = int(img_hw[0, 0].item())
-        w = int(img_hw[0, 1].item())
         # Image RoPE freqs [L, Dh//2] (complex); same for every sample in the bucket.
         # Kept COMPLEX (not view_as_real) so it crosses the pipeline boundary as a
         # non-floating-point tensor: DeepSpeed's pipe engine only runs backward
@@ -689,28 +742,41 @@ class InitialLayer(nn.Module):
         img_keep = torch.ones(B, Li, dtype=torch.bool, device=hidden_states.device)
         key_mask = torch.cat([txt_mask, img_keep], dim=1).view(B, 1, 1, -1)
 
-        return make_contiguous(hidden_states, encoder_hidden_states, key_mask, temb, img_freqs)
+        metadata = () if self.attention_backend == 'sdpa' else packed_attention_metadata(key_mask)
+        return make_contiguous(hidden_states, encoder_hidden_states, key_mask, temb, img_freqs, *metadata)
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, block, block_idx, num_heads, offloader):
+    def __init__(self, block, block_idx, num_heads, offloader, attention_backend='sdpa',
+                 attention_deterministic=False, checkpoint_enabled=True, compiled_forward=None):
         super().__init__()
         self.block = block
         self.block_idx = block_idx
         self.num_heads = num_heads
         self.offloader = offloader
+        self.attention_backend = attention_backend
+        self.attention_deterministic = attention_deterministic
+        self.checkpoint_enabled = checkpoint_enabled
+        self.compiled_forward = compiled_forward
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, key_mask, temb, img_freqs = inputs
+        hidden_states, encoder_hidden_states, key_mask, temb, img_freqs = inputs[:5]
+        metadata = inputs[5:]
 
         self.offloader.wait_for_block(self.block_idx)
-        encoder_hidden_states, hidden_states = _double_stream_block_forward(
+        forward = _double_stream_block_forward
+        block_freqs = img_freqs
+        if self.compiled_forward is not None and self.training:
+            forward = self.compiled_forward
+            block_freqs = torch.view_as_real(img_freqs)
+        encoder_hidden_states, hidden_states = forward(
             self.block, hidden_states, encoder_hidden_states, temb,
-            img_freqs, key_mask, self.num_heads)
+            block_freqs, key_mask, self.num_heads, self.attention_backend,
+            metadata, self.attention_deterministic)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(hidden_states, encoder_hidden_states, key_mask, temb, img_freqs)
+        return make_contiguous(hidden_states, encoder_hidden_states, key_mask, temb, img_freqs, *metadata)
 
 
 class FinalLayer(nn.Module):
@@ -721,7 +787,7 @@ class FinalLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, key_mask, temb, img_freqs = inputs
+        hidden_states, encoder_hidden_states, key_mask, temb, img_freqs = inputs[:5]
         # Batched AdaLayerNormContinuous (upstream cu_seqlens=None branch assumes
         # a flattened layout; do the [B, L, D] modulation explicitly here).
         emb = self.norm_out.linear(self.norm_out.silu(temb).to(hidden_states.dtype))
@@ -827,7 +893,8 @@ class MageFlowSamplingAdapter(vsampling.SamplingAdapter):
         text0, text1 = self.pipeline._pad_cached_embeds(text_cond, device)
         timestep = torch.full((1,), float(sigma), device=device, dtype=torch.float32)
         img_hw = torch.tensor([[h, w]], dtype=torch.int32, device=device)
-        inputs = (latents.to(self.pipeline.sampling_dtype()), text0, text1, timestep, img_hw)
+        img = rearrange(latents.to(self.pipeline.sampling_dtype()), 'b (h w) c -> b c h w', h=h, w=w)
+        inputs = (img, text0, text1, timestep, img_hw)
         out = vsampling.run_layer_stack(self._sampling_layers(), inputs)
         return out.float()
 
@@ -875,10 +942,12 @@ class MageFlowSamplingAdapter(vsampling.SamplingAdapter):
         if self._layers is None:
             transformer = self.pipeline.transformer
             layers = [InitialLayer(transformer, text_encoder=None,
-                                   drop_idx=PROMPT_TEMPLATE_ENCODE_START_IDX)]
+                                   drop_idx=PROMPT_TEMPLATE_ENCODE_START_IDX,
+                                   attention_backend=self.pipeline.attention_backend)]
             for i, block in enumerate(transformer.transformer_blocks):
                 layers.append(TransformerLayer(
-                    block, i, transformer.num_attention_heads, self.pipeline.offloader))
+                    block, i, transformer.num_attention_heads, self.pipeline.offloader,
+                    self.pipeline.attention_backend, self.pipeline.attention_deterministic))
             layers.append(FinalLayer(transformer))
             self._layers = layers
         return self._layers
