@@ -44,6 +44,8 @@ from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils import validation_sampling
+from utils.training_schedule import build_training_plan, print_training_plan, make_stage_scheduler, print_stage_schedule
+from utils.training_progress import TrainingProgress, batch_samples
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -65,6 +67,7 @@ parser.add_argument('--reset_optimizer', action='store_true')
 parser.add_argument('--reset_optimizer_params', action='store_true')
 parser.add_argument('--regenerate_cache', action='store_true', help='Force regenerate cache.')
 parser.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
+parser.add_argument('--print_training_plan', action='store_true', help='Prepare the dataset and print exact step/stage budgets, then exit before training.')
 parser.add_argument('--trust_cache', action='store_true', help='Load from metadata cache files if they exist, without checking if any fingerprints have changed. Can make loading much faster for large datasets.')
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
@@ -186,6 +189,8 @@ def print_model_info(model):
 # because it conflicts with the send / recv steps.
 def get_data_iterator_for_step(dataloader, engine, num_micro_batches=None):
     num_micro_batches = num_micro_batches or engine.micro_batches
+    if num_micro_batches != dataloader.gradient_accumulation_steps:
+        raise ValueError('Engine microbatch count disagrees with dataloader accumulation; refusing to cross epoch boundaries.')
     if not (engine.is_first_stage() or engine.is_last_stage()):
         return None
     dataloader_iter = iter(dataloader)
@@ -823,9 +828,18 @@ if __name__ == '__main__':
                     for p in pg['params']:
                         if 'lr' in pg:
                             param_kwargs['lr'] = pg['lr']
+                        if optim_type_lower == 'adamw8bitkahan':
+                            # Each one-parameter optimizer otherwise has index zero.
+                            param_kwargs['stochastic_rounding_seed'] = (
+                                kwargs.get('stochastic_rounding_seed', 0) + len(optimizer_dict) * 1000037
+                            )
                         optimizer_dict[p] = klass([p], **param_kwargs)
                 else:
                     # param
+                    if optim_type_lower == 'adamw8bitkahan':
+                        param_kwargs['stochastic_rounding_seed'] = (
+                            kwargs.get('stochastic_rounding_seed', 0) + len(optimizer_dict) * 1000037
+                        )
                     optimizer_dict[pg] = klass([pg], **param_kwargs)
 
             def optimizer_hook(p):
@@ -899,7 +913,14 @@ if __name__ == '__main__':
     model_engine.communication_data_type = communication_data_type
 
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
-    steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
+    training_plan = build_training_plan(
+        train_data, config['epochs'], model_engine.gradient_accumulation_steps(),
+        max_steps=config.get('max_steps'),
+    )
+    steps_per_epoch = training_plan['steps_per_epoch']
+    total_training_steps = training_plan['total_steps']
+    scheduler_base_lrs = [group['lr'] for group in optimizer.param_groups]
+    stage_cfg = None
 
     # LR scheduler: constant/linear (legacy) or StageLR pip package (https://github.com/nruaif/stage-lr)
     # Enable via any of:
@@ -943,16 +964,9 @@ if __name__ == '__main__':
                 from optimizers.stage_lr import StageLR  # legacy local copy
                 import warnings
                 warnings.warn("Using local optimizers/stage_lr.py; pip install stage-lr for standalone package: pip install git+https://github.com/nruaif/stage-lr.git")
-        total_iters = stage_cfg.get('total_iters') or stage_cfg.get('total_steps') or (config['epochs'] * steps_per_epoch)
-        warmup_steps = stage_cfg.get('warmup_steps', config.get('warmup_steps', 0))
-        if is_main_process():
-            source = 'explicit [StageLR].total_iters' if (stage_cfg.get('total_iters') or stage_cfg.get('total_steps')) else \
-                f"computed from steps_per_epoch ({steps_per_epoch}) x epochs ({config['epochs']})"
-            print(f'StageLR: total_iters={total_iters} ({source}), warmup_steps={warmup_steps}')
-            for s in stage_cfg['stages']:
-                n = max(1, round(s['percent'] * total_iters))
-                print(f"  stage '{s['type']}': {n} steps ({s['percent']*100:.0f}% of total_iters)")
-        lr_scheduler = StageLR(optimizer, stages=stage_cfg['stages'], total_iters=total_iters, warmup_steps=warmup_steps)
+        lr_scheduler, stage_automatic = make_stage_scheduler(
+            StageLR, optimizer, stage_cfg, total_training_steps, config.get('warmup_steps', 0),
+        )
     elif raw_scheduler == 'constant':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
         if config['warmup_steps'] > 0:
@@ -960,7 +974,7 @@ if __name__ == '__main__':
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
             lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
     elif raw_scheduler == 'linear':
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=max(1, total_training_steps - config['warmup_steps']))
         if config['warmup_steps'] > 0:
             warmup_steps = config['warmup_steps']
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
@@ -972,7 +986,8 @@ if __name__ == '__main__':
     model_engine.lr_scheduler = lr_scheduler
 
     step = 1
-    examples = global_batch_size
+    examples = 0
+    training_elapsed_seconds = 0.0
     # make sure to do this before calling model_engine.set_dataloader(), as that method creates an iterator
     # which starts creating dataloader internal state
     if resume_from_checkpoint:
@@ -980,7 +995,7 @@ if __name__ == '__main__':
         load_path, client_state = model_engine.load_checkpoint(
             run_dir,
             load_module_strict=False,
-            load_lr_scheduler_states='force_constant_lr' not in config and not args.reset_optimizer and not args.reset_optimizer_params,
+            load_lr_scheduler_states=stage_cfg is None and 'force_constant_lr' not in config and not args.reset_optimizer and not args.reset_optimizer_params,
             load_optimizer_states=not args.reset_optimizer,
         )
         if args.reset_optimizer_params:
@@ -993,12 +1008,42 @@ if __name__ == '__main__':
             train_dataloader.load_state_dict(client_state['custom_loader'])
         step = client_state['step'] + 1
         if 'examples' in client_state:
-            examples = client_state['examples'] + global_batch_size
+            examples = client_state['examples']
         else:
-            examples = step * global_batch_size
+            examples = (step - 1) * global_batch_size
+        training_elapsed_seconds = client_state.get('training_elapsed_seconds', 0.0)
         del client_state
         if is_main_process():
             print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
+
+    # The epoch position (including a reset loader) determines remaining work.
+    # This also handles continuation from an old, prematurely shortened epoch.
+    training_plan = build_training_plan(
+        train_data, config['epochs'], model_engine.gradient_accumulation_steps(),
+        max_steps=config.get('max_steps'), completed_steps=step - 1,
+        epoch=train_dataloader.epoch,
+        batches_consumed=train_dataloader.micro_batches_consumed // train_dataloader.gradient_accumulation_steps,
+    )
+    total_training_steps = training_plan['total_steps']
+    train_dataloader.training_plan = training_plan
+    if stage_cfg is not None and resume_from_checkpoint and training_plan['remaining_steps']:
+        lr_scheduler, stage_automatic = make_stage_scheduler(
+            StageLR, optimizer, stage_cfg, total_training_steps, config.get('warmup_steps', 0),
+            completed_steps=step - 1, base_lrs=scheduler_base_lrs,
+        )
+        model_engine.lr_scheduler = lr_scheduler
+    if is_main_process():
+        print_training_plan(training_plan)
+        if stage_cfg is not None:
+            print_stage_schedule(lr_scheduler, stage_automatic)
+        (Path(run_dir) / 'training_plan.json').write_text(json.dumps(training_plan, indent=2) + '\n')
+    if args.print_training_plan or training_plan['remaining_steps'] == 0:
+        if is_main_process():
+            print('Training plan ready; no optimizer updates executed.' if args.print_training_plan
+                  else 'Training budget already complete; no optimizer updates executed.')
+            tracker.finish()
+        dist.barrier()
+        sys.exit(0)
 
     if 'force_constant_lr' in config:
         model_engine.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
@@ -1037,118 +1082,160 @@ if __name__ == '__main__':
     epoch_loss = 0
     num_steps = 0
     empty_cuda_cache()
-    while True:
-        model_engine.reset_activation_shape()
-        iterator = get_data_iterator_for_step(train_dataloader, model_engine)
-        loss = model_engine.train_batch(iterator).item()
-        epoch_loss += loss
-        num_steps += 1
-        train_dataloader.sync_epoch()
+    progress = TrainingProgress(
+        total_training_steps, config['epochs'], initial=step - 1, elapsed=training_elapsed_seconds,
+        enabled=config.get('progress_bar', True), main_process=is_main_process(),
+        epoch=epoch,
+        image_only=all(b['size'][-1] == 1 for b in training_plan['buckets']),
+    )
+    train_dataloader.training_progress = progress
+    with progress:
+        while True:
+            step_started = time.perf_counter()
+            batch_index = train_dataloader.micro_batches_consumed // train_dataloader.gradient_accumulation_steps
+            samples_this_step = batch_samples(train_data, batch_index)
+            step_lrs = _get_param_group_lrs(optimizer) if is_main_process() else []
+            model_engine.reset_activation_shape()
+            iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+            loss = model_engine.train_batch(iterator).item()
+            step_seconds = time.perf_counter() - step_started
+            examples += samples_this_step
+            epoch_loss += loss
+            num_steps += 1
+            train_dataloader.sync_epoch()
+            if step > total_training_steps:
+                raise RuntimeError('Training exceeded the dataset-derived step budget.')
 
-        new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)
-        finished_epoch = True if new_epoch != epoch else False
+            shown_epoch_step = steps_per_epoch if train_dataloader.epoch != epoch else (
+                train_dataloader.micro_batches_consumed // train_dataloader.gradient_accumulation_steps
+            )
+            speed_metrics = progress.update(
+                step, epoch, shown_epoch_step, steps_per_epoch, loss=loss, lrs=step_lrs,
+                samples=samples_this_step, seconds=step_seconds,
+            )
+            new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)
+            finished_epoch = True if new_epoch != epoch else False
+            epoch_step = steps_per_epoch if finished_epoch else (
+                train_dataloader.micro_batches_consumed // train_dataloader.gradient_accumulation_steps
+            )
 
-        x_axis = examples if config['x_axis_examples'] else step
+            x_axis = examples if config['x_axis_examples'] else step
 
-        if is_main_process() and step % config['logging_steps'] == 0:
-            tb_writer.add_scalar(f'train/loss', loss, x_axis)
-            if hasattr(optimizer, '_grad_norm'):
-                tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+            if is_main_process() and step % config['logging_steps'] == 0:
+                for metric, value in speed_metrics.items():
+                    if value is not None:
+                        tb_writer.add_scalar(metric, value, x_axis)
+                tb_writer.add_scalar(f'train/loss', loss, x_axis)
+                if hasattr(optimizer, '_grad_norm'):
+                    tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
 
-            # Learning rate. DeepSpeed's own per-step line reports steps, loss,
-            # iter time and samples/sec but never the LR or the epoch, so
-            # without this a schedule like StageLR is invisible both in the
-            # terminal and in wandb/TensorBoard until a run has finished.
-            lrs = _get_param_group_lrs(optimizer)
-            if lrs:
-                tb_writer.add_scalar(f'train/lr', lrs[0], x_axis)
-                # Only present when param groups genuinely disagree.
-                for i, group_lr in enumerate(lrs[1:], start=1):
-                    tb_writer.add_scalar(f'train/lr_group{i}', group_lr, x_axis)
-            tb_writer.add_scalar(f'train/epoch', epoch, x_axis)
-
-            if tracker.enabled:
-                log_dict = {'train/loss': loss, 'train/epoch': epoch}
+                # Learning rate. DeepSpeed's own per-step line reports steps, loss,
+                # iter time and samples/sec but never the LR or the epoch, so
+                # without this a schedule like StageLR is invisible both in the
+                # terminal and in wandb/TensorBoard until a run has finished.
+                lrs = step_lrs  # LR used by this update, before the scheduler advances.
                 if lrs:
-                    log_dict['train/lr'] = lrs[0]
+                    tb_writer.add_scalar(f'train/lr', lrs[0], x_axis)
+                    # Only present when param groups genuinely disagree.
                     for i, group_lr in enumerate(lrs[1:], start=1):
-                        log_dict[f'train/lr_group{i}'] = group_lr
-                if hasattr(optimizer, '_grad_norm'):
-                    log_dict['train/grad_norm'] = optimizer._grad_norm
-                # step= is the actual x-axis wandb uses; a 'step' dict key is
-                # just another metric column and does NOT control it. Every
-                # wandb.log() call advances wandb's own internal step counter
-                # by one regardless of what's inside the dict, so two separate
-                # calls here would silently push wandb's x-axis two steps
-                # ahead of the console/TensorBoard step for this one iteration.
-                tracker.log(log_dict, step=x_axis)
+                        tb_writer.add_scalar(f'train/lr_group{i}', group_lr, x_axis)
+                tb_writer.add_scalar(f'train/epoch', epoch, x_axis)
+                tb_writer.add_scalar('train/total_steps', total_training_steps, x_axis)
+                tb_writer.add_scalar('train/steps_per_epoch', steps_per_epoch, x_axis)
+                tb_writer.add_scalar('train/epoch_step', epoch_step, x_axis)
+                tb_writer.add_scalar('train/progress', step / total_training_steps, x_axis)
 
-            if config.get('log_lr_to_console', True):
-                msg = (f'epoch: {epoch}  step: {step}  '
-                       f'lr: {_format_lrs(lrs)}  loss: {loss:.4f}')
-                if hasattr(optimizer, '_grad_norm'):
-                    msg += f'  grad_norm: {optimizer._grad_norm:.4f}'
-                print(msg)
-
-            if optimizer.__class__.__name__ == 'Prodigy':
-                prodigy_d = get_prodigy_d(optimizer)
-                tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)
-            if optimizer.__class__.__name__ in ('Automagic', 'GenericOptim'):
-                lrs, avg_lr = _get_automagic_lrs(optimizer)
-                if avg_lr > 0:
-                    tb_writer.add_histogram(f'train/automagic_lrs', lrs, x_axis)
-                    tb_writer.add_scalar(f'train/automagic_avg_lr', avg_lr, x_axis)
-
-        if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
-            evaluate(model, model_engine, eval_dataloaders, tb_writer, x_axis, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
-
-        # Validation sampling runs on its own cadence, separate from eval:
-        # loss eval is one forward pass, while sampling is a full denoising
-        # loop per prompt, so most runs want it far less often.
-        if validation_sampling.should_sample(sampling_config, step, epoch, finished_epoch):
-            if is_main_process():
-                label = f'epoch{epoch}' if finished_epoch else f'step{step}'
-                validation_sampling.generate_and_log_samples(
-                    model, sampling_config, tb_writer, x_axis, run_dir, label,
-                    sampling_round, tracker=tracker,
-                    disable_block_swap=disable_block_swap_for_eval)
-            sampling_round += 1
-            # Non-main ranks wait so nobody starts the next training step while
-            # rank 0 is still holding the GPU for generation.
-            dist.barrier()
-
-        if finished_epoch:
-            if is_main_process():
-                # Note the deliberate x-axis asymmetry: TensorBoard plots this
-                # against `epoch`, wandb against `x_axis`. They cannot match.
-                # wandb requires steps to be non-decreasing across all log()
-                # calls and silently DROPS anything logged at a lower step than
-                # one already seen. Epoch numbers are always far below the
-                # current step, so step=epoch here would discard every single
-                # epoch_loss point. TensorBoard has no such constraint and
-                # keeps per-metric x-axes independent.
-                tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
                 if tracker.enabled:
-                    tracker.log({'train/epoch_loss': epoch_loss/num_steps, 'train/epoch': epoch}, step=x_axis)
-            epoch_loss = 0
-            num_steps = 0
-            if new_epoch is None:
-                final_model_name = f'epoch{epoch}'
+                    log_dict = {'train/loss': loss, 'train/epoch': epoch,
+                                'train/total_steps': total_training_steps, 'train/steps_per_epoch': steps_per_epoch,
+                                'train/progress': step / total_training_steps, 'train/epoch_step': epoch_step}
+                    log_dict.update({k: v for k, v in speed_metrics.items() if v is not None})
+                    if lrs:
+                        log_dict['train/lr'] = lrs[0]
+                        for i, group_lr in enumerate(lrs[1:], start=1):
+                            log_dict[f'train/lr_group{i}'] = group_lr
+                    if hasattr(optimizer, '_grad_norm'):
+                        log_dict['train/grad_norm'] = optimizer._grad_norm
+                    # step= is the actual x-axis wandb uses; a 'step' dict key is
+                    # just another metric column and does NOT control it. Every
+                    # wandb.log() call advances wandb's own internal step counter
+                    # by one regardless of what's inside the dict, so two separate
+                    # calls here would silently push wandb's x-axis two steps
+                    # ahead of the console/TensorBoard step for this one iteration.
+                    tracker.log(log_dict, step=x_axis)
+
+                if not progress.live and config.get('log_lr_to_console', True):
+                    msg = (f"epoch: {epoch}/{config['epochs']}  step: {step}/{total_training_steps}  "
+                           f'epoch_step: {epoch_step}/{steps_per_epoch}  '
+                           f'lr: {_format_lrs(lrs)}  loss: {loss:.4f}  '
+                           f"{speed_metrics['train/seconds_per_step']:.2f}s/step  "
+                           f"{speed_metrics['train/samples_per_second']:.1f}{progress.sample_unit}/s  "
+                           f"elapsed: {speed_metrics['train/elapsed_seconds']:.0f}s  "
+                           f"ETA: {speed_metrics['train/eta_seconds']:.0f}s")
+                    if hasattr(optimizer, '_grad_norm'):
+                        msg += f'  grad_norm: {optimizer._grad_norm:.4f}'
+                    print(msg)
+
+                if optimizer.__class__.__name__ == 'Prodigy':
+                    prodigy_d = get_prodigy_d(optimizer)
+                    tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)
+                if optimizer.__class__.__name__ in ('Automagic', 'GenericOptim'):
+                    lrs, avg_lr = _get_automagic_lrs(optimizer)
+                    if avg_lr > 0:
+                        tb_writer.add_histogram(f'train/automagic_lrs', lrs, x_axis)
+                        tb_writer.add_scalar(f'train/automagic_avg_lr', avg_lr, x_axis)
+
+            if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
+                with progress.phase('validating'):
+                    evaluate(model, model_engine, eval_dataloaders, tb_writer, x_axis, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
+
+            # Validation sampling runs on its own cadence, separate from eval:
+            # loss eval is one forward pass, while sampling is a full denoising
+            # loop per prompt, so most runs want it far less often.
+            if validation_sampling.should_sample(sampling_config, step, epoch, finished_epoch):
+                with progress.phase('sampling'):
+                    if is_main_process():
+                        label = f'epoch{epoch}' if finished_epoch else f'step{step}'
+                        validation_sampling.generate_and_log_samples(
+                            model, sampling_config, tb_writer, x_axis, run_dir, label,
+                            sampling_round, tracker=tracker,
+                            disable_block_swap=disable_block_swap_for_eval)
+                    sampling_round += 1
+                    # Non-main ranks wait so nobody starts the next training step while
+                    # rank 0 is still holding the GPU for generation.
+                    dist.barrier()
+
+            if finished_epoch:
+                if is_main_process():
+                    # Note the deliberate x-axis asymmetry: TensorBoard plots this
+                    # against `epoch`, wandb against `x_axis`. They cannot match.
+                    # wandb requires steps to be non-decreasing across all log()
+                    # calls and silently DROPS anything logged at a lower step than
+                    # one already seen. Epoch numbers are always far below the
+                    # current step, so step=epoch here would discard every single
+                    # epoch_loss point. TensorBoard has no such constraint and
+                    # keeps per-metric x-axes independent.
+                    tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
+                    if tracker.enabled:
+                        tracker.log({'train/epoch_loss': epoch_loss/num_steps, 'train/epoch': epoch}, step=x_axis)
+                epoch_loss = 0
+                num_steps = 0
+                if new_epoch is None:
+                    final_model_name = f'epoch{epoch}'
+                    break
+                epoch = new_epoch
+
+            checkpointed, saved = saver.process_step(step, examples)
+            if 'max_steps' in config and step >= config['max_steps']:
+                final_model_name = f'step{step}'
                 break
-            epoch = new_epoch
+            step += 1
 
-        checkpointed, saved = saver.process_step(step, examples)
-        if 'max_steps' in config and step >= config['max_steps']:
-            final_model_name = f'step{step}'
-            break
-        step += 1
-        examples += global_batch_size
-
-    # Save final training state checkpoint and model, unless we just saved them.
-    if not checkpointed:
-        saver.save_checkpoint(step, examples)
-    if not saved:
-        saver.save_model(final_model_name)
+        # Save final training state checkpoint and model, unless we just saved them.
+        if not checkpointed:
+            saver.save_checkpoint(step, examples)
+        if not saved:
+            saver.save_model(final_model_name)
 
     if is_main_process():
         tracker.finish()

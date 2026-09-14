@@ -5,6 +5,8 @@ import torch
 import bitsandbytes
 import bitsandbytes.functional as F
 
+from optimizers.adamw_writeback import Writeback, _copy_bf16_stochastic_
+
 
 # Keys that older bitsandbytes exposed via get_config()/__init__ but which
 # newer versions removed entirely:
@@ -25,10 +27,8 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
     forward. That recovers most of the precision lost by keeping master weights
     in bf16, which is what makes bf16 training viable without an fp32 copy.
 
-    Because Kahan compensation is intrinsic to this class, there is no
-    `kahan_sum` toggle -- it is always on. A `kahan_sum` kwarg is accepted and
-    ignored (with a warning if someone tries to disable it) so that configs
-    written for optimi-style optimizers don't hard-crash here.
+    Kahan remains enabled by default. Explicit kahan_sum=False selects the
+    experimental SR-only mode and requires stochastic_rounding=True.
 
     stochastic_rounding enables BF16 parameter and residual writeback from
     per-parameter FP32 working tensors. force_kahan_buf_fp32 instead (or also)
@@ -38,14 +38,14 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
 
     def __init__(self, *args, stabilize=False, kahan_sum=None,
                  stochastic_rounding=False, force_kahan_buf_fp32=False,
-                 stochastic_rounding_seed=0, **kwargs):
+                 stochastic_rounding_seed=0, compile_writeback=False, **kwargs):
         if stabilize:
             raise ValueError('stabilize=True is unsupported: quantized state2 is not a real second moment.')
-        if kahan_sum is False:
-            warnings.warn(
-                'AdamW8bitKahan: kahan_sum=false was requested but Kahan summation is '
-                'intrinsic to this optimizer and cannot be disabled. Use type = '
-                "'adamw8bit' if you want plain AdamW8bit without compensation.")
+        self.kahan_sum = kahan_sum is not False
+        if not self.kahan_sum and not stochastic_rounding:
+            raise ValueError('kahan_sum=False requires stochastic_rounding=True (SR-only mode).')
+        if not self.kahan_sum and force_kahan_buf_fp32:
+            raise ValueError('force_kahan_buf_fp32 requires kahan_sum=True.')
         # Retain legacy options only when the installed BNB accepts them.
         for key in _LEGACY_BNB_KWARGS:
             if key in kwargs and key not in inspect.signature(bitsandbytes.optim.AdamW8bit).parameters:
@@ -59,14 +59,40 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
         self.force_kahan_buf_fp32 = force_kahan_buf_fp32
         self.stochastic_rounding_seed = int(stochastic_rounding_seed)
         self.non_castable_tensor_keys.add('shift')
+        self._writeback = Writeback(compile_writeback)
 
     def _shift_dtype(self, p):
         return torch.float32 if self.force_kahan_buf_fp32 else p.dtype
 
+    def state_dict(self):
+        result = super().state_dict()
+        result['adamw8bitkahan_settings'] = {
+            'kahan_sum': self.kahan_sum,
+            'stochastic_rounding': self.stochastic_rounding,
+            'stochastic_rounding_seed': self.stochastic_rounding_seed,
+        }
+        return result
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        settings = state_dict.get('adamw8bitkahan_settings')
+        if settings is not None:
+            for key, value in settings.items():
+                if getattr(self, key) != value:
+                    raise ValueError(f'Checkpoint {key}={value} differs from optimizer configuration; '
+                                     'resume with matching settings or start with fresh optimizer state.')
+        if not self.kahan_sum:
+            for state in state_dict['state'].values():
+                if 'shift' in state or 'shift' in state.get('__bnb_optimizer_quant_state__', {}):
+                    raise ValueError('Cannot load Kahan residuals in SR-only mode; start with fresh optimizer state.')
+        # Execution/compile options may change on resume; numerical options may not.
+        checkpoint = dict(state_dict)
+        checkpoint.pop('adamw8bitkahan_settings', None)
+        return super().load_state_dict(checkpoint, *args, **kwargs)
+
     @torch.no_grad()
     def init_state(self, group, p, gindex, pindex):
         super().init_state(group, p, gindex, pindex)
-        if p.dtype in (torch.bfloat16, torch.float16):
+        if self.kahan_sum and p.dtype in (torch.bfloat16, torch.float16):
             self.state[p]['shift'] = self.get_state_buffer(p, dtype=self._shift_dtype(p))
 
     @torch.no_grad()
@@ -91,11 +117,14 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
         if config.get('percentile_clipping', 100) < 100 and p.dtype == torch.bfloat16:
             raise ValueError('BF16 Kahan requires percentile_clipping=100; use trainer gradient clipping.')
 
-        # Preserve old checkpoint residuals, including when changing buffer precision.
-        if 'shift' not in state:
-            state['shift'] = torch.zeros_like(p, dtype=self._shift_dtype(p))
-        else:
-            state['shift'] = state['shift'].to(device=p.device, dtype=self._shift_dtype(p))
+        # A cross-mode checkpoint must not silently discard its residual.
+        if not self.kahan_sum and 'shift' in state:
+            raise ValueError('Cannot load Kahan residuals in SR-only mode; start with fresh optimizer state.')
+        if self.kahan_sum:
+            if 'shift' not in state:
+                state['shift'] = torch.zeros_like(p, dtype=self._shift_dtype(p))
+            else:
+                state['shift'] = state['shift'].to(device=p.device, dtype=self._shift_dtype(p))
 
         state["step"] += 1
         step = state["step"]
@@ -116,7 +145,10 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
             gnorm_scale = 1.0
 
         wide_update = self.stochastic_rounding or self.force_kahan_buf_fp32
-        shift = state['shift'].float() if wide_update else state['shift']
+        if not self.kahan_sum:
+            shift = torch.zeros_like(p, dtype=torch.float32)
+        else:
+            shift = state['shift'].float() if wide_update else state['shift']
         # BNB dispatches on gradient dtype and expects the update tensor to match.
         if wide_update:
             grad = grad.float()
@@ -125,6 +157,16 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
         if config['weight_decay'] != 0:
             shift.add_(p.detach(), alpha=-lr * config['weight_decay'])
 
+        self._update_buffer(grad, shift, state, config, step, lr, gnorm_scale)
+        self._writeback(
+            p.data, shift, state.get('shift'), wide_update=wide_update,
+            stochastic=self.stochastic_rounding,
+            seed=(self.stochastic_rounding_seed + step * 1000003
+                  + gindex * 1000033 + pindex * 1000037) % (2**63),
+        )
+
+    def _update_buffer(self, grad, shift, state, config, step, lr, gnorm_scale):
+        """BNB owns Adam moments; its parameter is an update buffer, with zero decay."""
         if state["state1"].dtype == torch.float:
             F.optimizer_update_32bit(
                 self.optimizer_name,
@@ -203,39 +245,3 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
 
         else:
             raise RuntimeError(f"Unsupported optimizer state dtype: {state['state1'].dtype}")
-
-        # Fold the update into p and retain the error from parameter writeback.
-        if wide_update:
-            previous = p.float()
-            updated = previous + shift
-            if self.stochastic_rounding:
-                # Rank-local training RNG differs with data/noise. Use identical
-                # rounding on replicated parameters, reproducible after resume.
-                generator = torch.Generator(device=p.device)
-                generator.manual_seed((self.stochastic_rounding_seed + step * 1000003
-                                       + gindex * 1000033 + pindex * 1000037) % (2**63))
-                _copy_bf16_stochastic_(p.data, updated, generator)
-            else:
-                p.data.copy_(updated)
-            shift.add_(previous.sub_(p.float()))
-            if self.stochastic_rounding and state['shift'].dtype == torch.bfloat16:
-                _copy_bf16_stochastic_(state['shift'], shift, generator)
-            else:
-                state['shift'].copy_(shift)
-        else:
-            buffer = p.clone()
-            p.add_(shift)
-            shift.add_(buffer.sub_(p))
-
-
-@torch.no_grad()
-def _copy_bf16_stochastic_(target, source, generator=None):
-    """Unbiased FP32 -> BF16 rounding; preserve NaN/Inf and finite overflow casts."""
-    bits = source.contiguous().view(torch.int32)
-    rounded = torch.empty_like(bits).random_(0, 65536, generator=generator)
-    rounded.add_(bits).bitwise_and_(-65536)
-    values = rounded.view(torch.float32)
-    # Do not turn NaNs into infinities or wrap values at the exponent boundary.
-    ordinary = source.to(torch.bfloat16)
-    values = torch.where(torch.isfinite(source) & torch.isfinite(ordinary), values, source)
-    target.copy_(values)

@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import nullcontext
 import os
 import shutil
 import time
@@ -113,24 +114,30 @@ class Saver:
             shutil.rmtree(tmp_dir)
 
     def save_model(self, name):
-        if is_main_process():
-            print(f'Saving model to directory {name}')
-        if self.is_adapter:
-            self.save_adapter(name)
-        else:
-            self.save_full_model(name)
+        progress = getattr(self.train_dataloader, 'training_progress', None)
+        with progress.phase('saving model') if progress else nullcontext():
+            if is_main_process():
+                print(f'Saving model to directory {name}')
+            if self.is_adapter:
+                self.save_adapter(name)
+            else:
+                self.save_full_model(name)
 
     def save_checkpoint(self, step, examples):
-        self.model_engine.save_checkpoint(
-            self.save_root,
-            client_state={
-                'step': step,
-                'examples': examples,
-                'custom_loader': self.train_dataloader.state_dict(),
-            },
-            save_latest=True,
-            exclude_frozen_parameters=True
-        )
+        progress = getattr(self.train_dataloader, 'training_progress', None)
+        with progress.phase('saving checkpoint') if progress else nullcontext():
+            self.model_engine.save_checkpoint(
+                self.save_root,
+                client_state={
+                    'step': step,
+                    'examples': examples,
+                    'custom_loader': self.train_dataloader.state_dict(),
+                    'training_plan': getattr(self.train_dataloader, 'training_plan', None),
+                    'training_elapsed_seconds': progress.elapsed if progress else 0.0,
+                },
+                save_latest=True,
+                exclude_frozen_parameters=True
+            )
 
     def process_epoch(self, epoch, step, examples):
         checkpointed, saved = False, False

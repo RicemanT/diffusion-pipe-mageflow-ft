@@ -179,7 +179,7 @@ steps = 20
 seed = 7
  
 [StageLR]
-# total_iters optional — defaults to epochs*steps_per_epoch if omitted
+# Omit total_iters (or use "auto"): exact bucketed training budget, minus separate warmup.
 stages = [
     { type = "linear",   end_lr = 1e-4, percent = 0.1 },
     { type = "cosine",   end_lr = 5e-5, percent = 0.3 },

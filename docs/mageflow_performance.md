@@ -1,5 +1,8 @@
 # MageFlow performance and safety audit
 
+The empty-mask accumulation/data-loss bug and exact epoch/StageLR planning are
+covered in [Training counts and StageLR](training_schedule.md).
+
 Subsequent optimizer correctness work is documented in
 [AdamW8bitKahan correctness and precision](adamw8bitkahan.md), including the
 weight-decay fix and optional stochastic rounding. The unchanged-optimizer
@@ -17,9 +20,9 @@ augmentation, attribution rules, sampling cadence, trainable parameters, or
 state-dict names were changed. Default attention remains SDPA. The original
 token-layout input remains accepted by the initial layer for external callers.
 
-The pasted `total_iters = #have to calculate yourself` is not valid TOML until
-filled in. Its value needs the processed bucket counts and intended continuation
-schedule; no value has been guessed. Loading `transformer_path` starts from model
+The pasted `total_iters = #have to calculate yourself` is invalid TOML. Omit that
+line or set `total_iters = 'auto'`; the trainer now derives the schedule from the
+processed buckets and remaining training budget. Loading `transformer_path` starts from model
 weights; it does not itself restore Adam moments, Kahan compensation, dataloader
 position, or StageLR progress. Full continuation uses the trainer's existing
 `--resume_from_checkpoint` mechanism.

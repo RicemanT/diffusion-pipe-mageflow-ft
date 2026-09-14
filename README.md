@@ -112,6 +112,12 @@ For images, any image format that can be loaded by Pillow should work. For video
 See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.
 
 ## Training
+
+The trainer prints exact bucket-based epoch and total step counts before training.
+StageLR uses that budget automatically when `total_iters` is omitted. Append
+`--print_training_plan` to inspect the plan without training updates. See
+[Training counts, live progress, and StageLR](docs/training_schedule.md), including the fix for
+empty masks silently truncating gradient-accumulation batches.
 **Start by reading through the config files in the examples directory.** Almost everything is commented, explaining what each setting does. [This config file](./examples/main_example.toml) is the main example with all of the comments. [This dataset config file](./examples/dataset.toml) has the documentation for the dataset options.
 
 Once you've familiarized yourself with the config file format, go ahead and make a copy and edit to your liking. At minimum, change all the paths to conform to your setup, including the paths in the dataset config file.

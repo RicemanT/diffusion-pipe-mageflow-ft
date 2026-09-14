@@ -337,6 +337,7 @@ class ConcatenatedBatchedDataset:
             iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
             cumulative_sums[dataset_idx] += 1
         self.iteration_order = np.array(iteration_order)
+        self.num_samples_before_padding = len(iteration_order)
 
         # size_bucket could be [ar, w, h, frame] or [w, h, frames]
         global_batch_size_dict = global_batch_size_image if size_bucket[-1] == 1 else global_batch_size
@@ -353,6 +354,7 @@ class ConcatenatedBatchedDataset:
                     min_diff = diff
                     self.global_batch_size = bs
 
+        self.requested_global_batch_size = self.global_batch_size
         self._fit_batches()
         assert self.global_batch_size % self.data_parallel_world_size == 0
         self.batch_size = self.global_batch_size // self.data_parallel_world_size
@@ -1254,14 +1256,28 @@ class DatasetManager:
 
 
 def split_batch(batch, pieces):
-    # Each of features, label is a tuple of tensors.
     features, label = batch
-    split_size = features[0].size(0) // pieces
-    # The tuples passed to Deepspeed need to only contain tensors. For None (e.g. mask, or optional conditioning), convert to empty tensor.
-    split_features = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in features))
-    split_label = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in label))
-    # Deepspeed works with a tuple of (features, labels).
-    return list(zip(split_features, split_label))
+    batch_size = features[0].size(0)
+    if pieces < 1 or batch_size < pieces or batch_size % pieces:
+        raise ValueError(f'Cannot split batch of {batch_size} samples into {pieces} equal microbatches.')
+    split_size = batch_size // pieces
+
+    def split(tensor):
+        # Empty tensors are the pipeline's sentinel for absent masks/conditioning.
+        # torch.split(empty, ...) returns ONE chunk; zip used to silently drop
+        # every other image microbatch when accumulation was greater than one.
+        if tensor is None:
+            return [torch.tensor([])] * pieces
+        if tensor.numel() == 0:
+            return [tensor] * pieces
+        if tensor.ndim == 0 or tensor.size(0) != batch_size:
+            raise ValueError(f'Batch tensor shape {tuple(tensor.shape)} does not match batch size {batch_size}.')
+        return torch.split(tensor, split_size)
+
+    split_features = [split(tensor) for tensor in features]
+    split_labels = [split(tensor) for tensor in label]
+    return [(tuple(t[i] for t in split_features), tuple(t[i] for t in split_labels))
+            for i in range(pieces)]
 
 
 # Splits an example (feature dict) along the batch dimension into a list of examples.
@@ -1299,6 +1315,7 @@ class PipelineDataLoader:
         self.eval_quantile = None
         self.epoch = 1
         self.num_batches_pulled = 0
+        self.micro_batches_consumed = 0
         self.next_micro_batch = None
         self.recreate_dataloader = False
         # Be careful to only create the DataLoader some bounded number of times: https://github.com/pytorch/pytorch/issues/91252
@@ -1308,6 +1325,7 @@ class PipelineDataLoader:
     def reset(self):
         self.epoch = 1
         self.num_batches_pulled = 0
+        self.micro_batches_consumed = 0
         self.next_micro_batch = None
         self.data = self._pull_batches_from_dataloader()
 
@@ -1325,14 +1343,19 @@ class PipelineDataLoader:
         if self.next_micro_batch == None:
             self.next_micro_batch = next(self.data)
         ret = self.next_micro_batch
+        self.micro_batches_consumed += 1
         try:
             self.next_micro_batch = next(self.data)
         except StopIteration:
+            if self.micro_batches_consumed != len(self):
+                raise RuntimeError(f'Dataloader yielded {self.micro_batches_consumed} microbatches, '
+                                   f'but the training plan requires {len(self)}. Refusing a truncated epoch.')
             if self.recreate_dataloader:
                 self._create_dataloader()
                 self.recreate_dataloader = False
             self.data = self._pull_batches_from_dataloader()
             self.num_batches_pulled = 0
+            self.micro_batches_consumed = 0
             self.next_micro_batch = None
             self.epoch += 1
         return ret
@@ -1392,11 +1415,14 @@ class PipelineDataLoader:
     def sync_epoch(self):
         from utils.distributed_control import max_int
         self.epoch = max_int(self.epoch)
+        active = self.model_engine.is_first_stage() or self.model_engine.is_last_stage()
+        self.micro_batches_consumed = max_int(self.micro_batches_consumed if active else 0)
 
     def state_dict(self):
         return {
             'epoch': self.epoch,
             'num_batches_pulled': self.num_batches_pulled,
+            'num_batches_consumed': self.micro_batches_consumed // self.gradient_accumulation_steps,
         }
 
     def load_state_dict(self, state_dict):
@@ -1404,7 +1430,15 @@ class PipelineDataLoader:
         self.epoch = state_dict['epoch']
         # -1 because by preloading the next micro_batch, it's always going to have one more batch
         # pulled than the actual number of batches iterated by the caller.
-        self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
+        self.num_batches_pulled = state_dict.get(
+            'num_batches_consumed', max(0, state_dict['num_batches_pulled'] - 1)
+        )
+        if not 0 <= self.num_batches_pulled <= len(self.dataset):
+            raise ValueError('Checkpoint dataloader position exceeds the processed dataset length.')
+        if self.num_batches_pulled == len(self.dataset):
+            self.epoch += 1
+            self.num_batches_pulled = 0
+        self.micro_batches_consumed = self.num_batches_pulled * self.gradient_accumulation_steps
         self._create_dataloader(skip_first_n_batches=self.num_batches_pulled)
         self.data = self._pull_batches_from_dataloader()
         # Recreate the dataloader after the first pass so that it won't skip
@@ -1419,7 +1453,7 @@ class SkipFirstNSampler(torch.utils.data.Sampler):
         self.dataset_length = dataset_length
 
     def __len__(self):
-        return self.dataset_length
+        return max(0, self.dataset_length - self.n)
 
     def __iter__(self):
         for i in range(self.n, self.dataset_length):
