@@ -1,4 +1,5 @@
 """Tensor-only AdamW writeback, separate from bitsandbytes and RNG management."""
+import time
 import warnings
 
 import torch
@@ -52,6 +53,7 @@ class Writeback:
         self.requested = compiled
         self.compiled = None
         self.failed = False
+        self.success_reported = False
 
     @torch.no_grad()
     def __call__(self, parameter, update, residual, *, wide_update, stochastic, seed):
@@ -62,7 +64,10 @@ class Writeback:
             if residual is not None and residual.dtype == torch.bfloat16:
                 residual_noise = torch.empty_like(update, dtype=torch.int32).random_(0, 65536, generator=generator)
         args = (parameter, update, residual, wide_update, noise, residual_noise)
+        first_call_started = None
         if self.requested and not self.failed:
+            if not self.success_reported:
+                first_call_started = time.perf_counter()
             try:
                 if self.compiled is None:
                     # Inductor normally removes intermediate BF16 round trips.
@@ -81,3 +86,13 @@ class Writeback:
         parameter.copy_(new_parameter)
         if residual is not None:
             residual.copy_(new_residual)
+        if first_call_started is not None and not self.failed:
+            self.success_reported = True
+            distributed = torch.distributed
+            if not distributed.is_available() or not distributed.is_initialized() or distributed.get_rank() == 0:
+                elapsed = time.perf_counter() - first_call_started
+                print(
+                    f'AdamW compiled writeback active: first call returned in {elapsed:.2f}s '
+                    '(includes compilation; additional shapes may compile later).',
+                    flush=True,
+                )

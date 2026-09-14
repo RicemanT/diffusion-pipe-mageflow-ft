@@ -147,6 +147,13 @@ same noise and never repeating the Adam update. First-use compilation adds start
 cost; dtype/rank/shape variants may need additional graphs. Older PyTorch versions
 without the required compiler option fall back with a warning.
 
+After the first successful compiled call and parameter writeback, rank zero prints
+`AdamW compiled writeback active: first call returned in ...s` once per writeback
+instance. This is host wall time including first-use compilation, not a synchronized
+GPU benchmark. It adds no CUDA synchronization. Further shapes may still compile;
+any later compilation failure still warns and switches that instance to eager.
+Disabled compilation and failed first attempts do not print a success message.
+
 ## Reproducing the evaluation
 
 ```bash
