@@ -138,8 +138,10 @@ The [wan_14b_min_vram.toml](./examples/wan_14b_min_vram.toml) example file has a
   lr = 5e-5
   betas = [0.9, 0.99]
   weight_decay = 0.01
-  stabilize = false
-  ```
+    stabilize = false
+    ```
+    Optional BF16 stochastic rounding and FP32 compensation settings are described in
+    [AdamW8bitKahan correctness and precision](docs/adamw8bitkahan.md).
 - Use block swapping if the model supports it: ```blocks_to_swap = 32```
 - Try the expandable_segments feature in the CUDA memory allocator:
   - ```PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True NCCL_P2P_DISABLE="1" NCCL_IB_DISABLE="1" deepspeed --num_gpus=1 train.py --deepspeed --config /home/you/path/to/config.toml```

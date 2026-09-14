@@ -1,5 +1,10 @@
 # MageFlow performance and safety audit
 
+Subsequent optimizer correctness work is documented in
+[AdamW8bitKahan correctness and precision](adamw8bitkahan.md), including the
+weight-decay fix and optional stochastic rounding. The unchanged-optimizer
+statements below describe the original performance audit only.
+
 ## Scope and compatibility
 
 This pass targets the supplied 8-H100 full-finetune setup: `pipeline_stages=1`,
