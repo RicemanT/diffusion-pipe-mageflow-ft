@@ -3,6 +3,8 @@ A pipeline parallel training script for diffusion models.
 
 MageFlow users: see the [performance audit and H100 validation guide](docs/mageflow_performance.md)
 for compatible optimizations, optional FlashAttention, and benchmarking instructions.
+For Bluvoll's shared-AdaLN/SVD checkpoints, see [compressed MageFlow training](docs/mageflow_compression.md)
+and the [single-H100 smoke configuration](examples/mage_flow_compressed_finetune.toml).
 
 Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein).
 

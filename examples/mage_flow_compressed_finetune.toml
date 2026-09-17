@@ -1,0 +1,40 @@
+# Initial single-H100 smoke run. Replace paths, validate, then extend the run.
+output_dir = '/workspace/output/magetrail-compressed-smoke'
+dataset = '/workspace/diffusion-pipe-mageflow-ft/mage_flow_dataset.toml'
+epochs = 1
+max_steps = 20
+micro_batch_size_per_gpu = 1
+gradient_accumulation_steps = 2
+pipeline_stages = 1
+activation_checkpointing = true
+reentrant_activation_checkpointing = false
+gradient_clipping = 1.0
+save_every_n_steps = 10
+checkpoint_every_n_minutes = 60
+save_dtype = 'bfloat16' # Compressed factors are exported in FP32 independently.
+steps_per_print = 1
+
+[model]
+type = 'mage_flow'
+# Supplies the existing Qwen tokenizer/text encoder and Mage VAE.
+diffusers_path = '/workspace/models/mage-flow'
+# No adjacent config.json is necessary for the compressed transformer.
+transformer_path = '/workspace/models/magetrail-compressed/transformer/MageTrail-v0.2-rank256-fp64-qr-evaluated.safetensors'
+dtype = 'bfloat16'
+transformer_dtype = 'bfloat16'
+compressed_adaln_dtype = 'float32'
+cache_text_embeddings = true
+max_text_tokens = 512
+attention_backend = 'sdpa'
+timestep_sample_method = 'logit_normal'
+sigmoid_scale = 1.0
+shift = 6.0
+vae_sample_posterior = false
+
+# No [adapter] section: train the trunk, shared projection, and all heads.
+[optimizer]
+type = 'AdamW8bitKahan'
+lr = 2e-6
+betas = [0.9, 0.999]
+weight_decay = 0.01
+eps = 1e-8

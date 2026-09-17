@@ -32,6 +32,7 @@ watermarking are intentionally not part of the training graph.
 import os
 import sys
 import math
+import json
 from pathlib import Path
 
 import torch
@@ -48,6 +49,10 @@ from utils.offloading import ModelOffloader
 from utils import caption_processing as capproc
 from utils import validation_sampling as vsampling
 from utils.mageflow_text import encode_text_hidden
+from utils.mageflow_compression import (
+    ARCHITECTURE, compressed_parameter, read_transformer_config,
+    install_compressed_modulation, resolve_modulation_dtype,
+)
 from utils.mageflow_execution import validate_execution_config, compile_block_forward
 from utils.mageflow_attention import (
     packed_attention, packed_attention_metadata, validate_attention_backend,
@@ -121,8 +126,13 @@ def _double_stream_block_forward(block, hidden_states, encoder_hidden_states, te
     """
     attn = block.attn
 
-    img_mod1, img_mod2 = block.img_mod(temb).chunk(2, dim=-1)  # each [B, 3*dim]
-    txt_mod1, txt_mod2 = block.txt_mod(temb).chunk(2, dim=-1)
+    img_mod = block.img_mod(temb)
+    txt_mod = block.txt_mod(temb)
+    if getattr(block, 'compressed_modulation', False):
+        img_mod = img_mod.to(hidden_states.dtype)
+        txt_mod = txt_mod.to(encoder_hidden_states.dtype)
+    img_mod1, img_mod2 = img_mod.chunk(2, dim=-1)  # each [B, 3*dim]
+    txt_mod1, txt_mod2 = txt_mod.chunk(2, dim=-1)
 
     # --- norm1 + modulation ---
     img_modulated, img_gate1 = _modulate(block.img_norm1(hidden_states), img_mod1)
@@ -334,10 +344,23 @@ class MageFlowPipeline(BasePipeline):
 
         params = self._transformer_params()
         validate_execution_config(self.config, num_blocks=params.depth)
-        transformer = MageFlow(params)
+        rank = self.transformer_config.get('modulation_rank', 0)
+        self.compressed_modulation = bool(rank)
+        modulation_dtype = resolve_modulation_dtype(self.model_config)
+        if rank:
+            # Avoid allocating the original 1.36B dense AdaLN parameters.
+            with torch.device('meta'):
+                transformer = MageFlow(params)
+                install_compressed_modulation(transformer, rank, modulation_dtype)
+            # Mage RoPE keeps plain tensor caches outside the state dict. They
+            # cannot be materialized by assign=True and must be rebuilt on CPU.
+            transformer.pos_embed = type(transformer.pos_embed)(
+                theta=10000, axes_dim=params.axes_dim, scale_rope=True)
+        else:
+            transformer = MageFlow(params)
 
         sd = load_file(transformer_path, device='cpu')
-        missing, unexpected = transformer.load_state_dict(sd, strict=False, assign=True)
+        missing, unexpected = transformer.load_state_dict(sd, strict=bool(rank), assign=True)
         if missing:
             print(f'MageFlow load: {len(missing)} missing keys (e.g. {missing[:3]})')
         if unexpected:
@@ -346,22 +369,25 @@ class MageFlowPipeline(BasePipeline):
         # Cast: blocks -> transformer_dtype, everything else / 1D -> dtype.
         for name, p in transformer.named_parameters():
             keep = any(k in name for k in KEEP_IN_HIGH_PRECISION) or p.ndim == 1
-            p.data = p.data.to(dtype if keep else transformer_dtype)
+            target_dtype = dtype if keep else transformer_dtype
+            if rank and compressed_parameter(name):
+                target_dtype = modulation_dtype
+            p.data = p.data.to(target_dtype)
 
         self.transformer = transformer
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
             p.original_name = name
+        if rank:
+            print(f'MageFlow: loaded compressed modulation rank={rank}, factors={modulation_dtype}; '
+                  'shared projection and separate block heads retained.')
 
     def _transformer_params(self):
-        import json
         transformer_path = self.model_config.get('transformer_path', None)
-        if transformer_path is not None:
-            cfg_path = Path(transformer_path).parent / 'config.json'
-        else:
-            cfg_path = Path(self.model_config['diffusers_path']) / 'transformer' / 'config.json'
-        with open(cfg_path) as f:
-            c = json.load(f)
+        if transformer_path is None:
+            transformer_path = Path(self.model_config['diffusers_path']) / 'transformer' / 'diffusion_pytorch_model.safetensors'
+        c = read_transformer_config(transformer_path)
+        self.transformer_config = c
         return MageFlowParams(
             in_channels=c['in_channels'],
             out_channels=c['out_channels'],
@@ -392,7 +418,22 @@ class MageFlowPipeline(BasePipeline):
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def save_model(self, save_dir, state_dict):
-        safetensors.torch.save_file(state_dict, save_dir / 'diffusion_pytorch_model.safetensors', metadata={'format': 'pt'})
+        metadata = {'format': 'pt'}
+        if self.compressed_modulation:
+            metadata.update(architecture=ARCHITECTURE, model_config=json.dumps(self.transformer_config))
+            state_dict = {k: v.float() if compressed_parameter(k) else v for k, v in state_dict.items()}
+        safetensors.torch.save_file(state_dict, save_dir / 'diffusion_pytorch_model.safetensors', metadata=metadata)
+        (save_dir / 'config.json').write_text(json.dumps(self.transformer_config, indent=2) + '\n', encoding='utf-8')
+
+    def model_save_dtype(self, name, default):
+        # Called BEFORE generic export casting: upcasting later cannot undo BF16 rounding.
+        if self.compressed_modulation and compressed_parameter(name):
+            return torch.float32
+        return default
+
+    def training_communication_dtype(self, default):
+        # DeepSpeed can cast even FP32 gradient buckets to communication_data_type.
+        return torch.float32 if self.compressed_modulation else default
 
     def get_call_vae_fn(self, vae):
         def fn(*args):
@@ -682,6 +723,7 @@ class InitialLayer(nn.Module):
         self.txt_in = model.txt_in
         self.time_text_embed = model.time_text_embed
         self.pos_embed = model.pos_embed
+        self.modulation_down = getattr(model, 'modulation_down', None)
         # Resident (frozen) text encoder for on-the-fly mode; None when text
         # embeddings are cached. Registered as a submodule so the pipeline
         # moves it to the stage-0 device.
@@ -743,7 +785,11 @@ class InitialLayer(nn.Module):
         key_mask = torch.cat([txt_mask, img_keep], dim=1).view(B, 1, 1, -1)
 
         metadata = () if self.attention_backend == 'sdpa' else packed_attention_metadata(key_mask)
-        return make_contiguous(hidden_states, encoder_hidden_states, key_mask, temb, img_freqs, *metadata)
+        block_conditioning = ()
+        if self.modulation_down is not None:
+            block_conditioning = (self.modulation_down(F.silu(temb)),)
+        return make_contiguous(hidden_states, encoder_hidden_states, key_mask, temb, img_freqs,
+                               *block_conditioning, *metadata)
 
 
 class TransformerLayer(nn.Module):
@@ -758,11 +804,16 @@ class TransformerLayer(nn.Module):
         self.attention_deterministic = attention_deterministic
         self.checkpoint_enabled = checkpoint_enabled
         self.compiled_forward = compiled_forward
+        self.compressed_modulation = getattr(block, 'compressed_modulation', False)
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         hidden_states, encoder_hidden_states, key_mask, temb, img_freqs = inputs[:5]
         metadata = inputs[5:]
+        block_temb = temb
+        if self.compressed_modulation:
+            block_temb, *metadata = metadata
+            metadata = tuple(metadata)
 
         self.offloader.wait_for_block(self.block_idx)
         forward = _double_stream_block_forward
@@ -771,12 +822,12 @@ class TransformerLayer(nn.Module):
             forward = self.compiled_forward
             block_freqs = torch.view_as_real(img_freqs)
         encoder_hidden_states, hidden_states = forward(
-            self.block, hidden_states, encoder_hidden_states, temb,
+            self.block, hidden_states, encoder_hidden_states, block_temb,
             block_freqs, key_mask, self.num_heads, self.attention_backend,
             metadata, self.attention_deterministic)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(hidden_states, encoder_hidden_states, key_mask, temb, img_freqs, *metadata)
+        return make_contiguous(hidden_states, encoder_hidden_states, key_mask, temb, img_freqs, *inputs[5:])
 
 
 class FinalLayer(nn.Module):

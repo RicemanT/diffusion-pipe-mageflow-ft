@@ -14,9 +14,10 @@ from utils.common import is_main_process
 from utils.distributed_control import broadcast_int
 
 
-def convert_state_dict_dtype(state_dict, dtype):
+def convert_state_dict_dtype(state_dict, dtype, dtype_for_parameter=None):
     for key, v in state_dict.items():
-        state_dict[key] = v.to(device='cpu', dtype=dtype)
+        target = dtype_for_parameter(key, dtype) if dtype_for_parameter else dtype
+        state_dict[key] = v.to(device='cpu', dtype=target)
 
 
 last_checkpoint_time = None
@@ -102,7 +103,8 @@ class Saver:
             # With BF16_Optimizer, we get pickle errors unless we do p.detach(). I have no idea why.
             partial_state_dict = {p.original_name: p.detach() for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
             if 'save_dtype' in self.config:
-                convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
+                convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'],
+                                         getattr(self.model, 'model_save_dtype', None))
             torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
         dist.barrier()
         if dp_id == 0 and stage_id == 0:
